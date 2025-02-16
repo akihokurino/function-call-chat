@@ -31,9 +31,9 @@ async def send_email(to: str, subject: str, body: str) -> None:
 
     async with aiohttp.ClientSession() as session:
         async with session.post(
-                SENDGRID_URL,
-                headers=header,
-                json=payload,
+            SENDGRID_URL,
+            headers=header,
+            json=payload,
         ) as response:
             response_text: str = await response.text()
             if response.status != 202:
