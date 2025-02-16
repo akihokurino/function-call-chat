@@ -1,0 +1,9 @@
+.idea
+venv
+.env
+node_modules
+__pycache__
+.DS_Store
+cache
+output
+private.pdf
