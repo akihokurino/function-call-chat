@@ -26,9 +26,6 @@ async def send_email(to: str, subject: str, body: str) -> None:
         "Authorization": f"Bearer {SENDGRID_API_KEY}",
     }
 
-    print(payload)
-    print(header)
-
     async with aiohttp.ClientSession() as session:
         async with session.post(
             SENDGRID_URL,
