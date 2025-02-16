@@ -82,7 +82,7 @@ class _ChatCompletionPayload(BaseModel):
     messages: list[Message]
 
 
-def _function_call_message(
+def _answer_after_function_call(
     response: ChatCompletion,
     messages: list[ChatCompletionMessageParam],
     tool_id: str,
@@ -122,21 +122,31 @@ def _function_call_message(
 @app.post("/chat_completion")
 async def _chat_completion(payload: _ChatCompletionPayload) -> JSONResponse:
     messages: list[ChatCompletionMessageParam] = []
-    for message in payload.messages:
-        if message.role == "assistant":
-            messages.append(
-                ChatCompletionAssistantMessageParam(
-                    role="assistant",
-                    content=message.content,
-                )
+    if len(payload.messages) == 1:
+        messages.append(
+            ChatCompletionUserMessageParam(
+                role="user",
+                content=payload.messages[-1].content,
             )
-        if message.role == "user":
-            messages.append(
-                ChatCompletionUserMessageParam(
-                    role="user",
-                    content=message.content,
+        )
+    if len(payload.messages) > 1:
+        for message in payload.messages[-2:]:
+            if message.role == "assistant":
+                messages.append(
+                    ChatCompletionAssistantMessageParam(
+                        role="assistant",
+                        content=message.content,
+                    )
                 )
-            )
+            if message.role == "user":
+                messages.append(
+                    ChatCompletionUserMessageParam(
+                        role="user",
+                        content=message.content,
+                    )
+                )
+
+    print(f"Messages: {messages}")
 
     # Stream=trueだとfunction callがうまく動かない
     response = client.chat.completions.create(
@@ -175,10 +185,10 @@ async def _chat_completion(payload: _ChatCompletionPayload) -> JSONResponse:
             rainfall = (
                 weather_result.feature[0].property_.weather_list.weather[0].rainfall
             )
-            weather_info = f"{location} の降水量: {rainfall} mm"
+            weather_info = f"{location} の降水量: {rainfall} mmです。降水量を元に、天気を予測してください。"
             print(f"Weather: {weather_info}")
 
-            final_response = _function_call_message(
+            final_response = _answer_after_function_call(
                 response, messages, tool_call.id, weather_info
             )
 
