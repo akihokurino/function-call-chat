@@ -1,17 +1,22 @@
 import json
 import os
-from typing import final, AsyncGenerator, Literal
+from typing import Literal, final, cast
 
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse
 from openai import OpenAI
+from openai.types.chat import ChatCompletion
 from openai.types.chat.chat_completion_assistant_message_param import (
     ChatCompletionAssistantMessageParam,
 )
 from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
+from openai.types.chat.chat_completion_message_tool_call_param import (
+    ChatCompletionMessageToolCallParam,
+    Function,
+)
 from openai.types.chat.chat_completion_tool_message_param import (
     ChatCompletionToolMessageParam,
 )
@@ -27,9 +32,7 @@ from yahoo import fetch_weather
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-client = OpenAI(
-    api_key=OPENAI_API_KEY,
-)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 tools: list[ChatCompletionToolParam] = [
     {
@@ -52,6 +55,7 @@ tools: list[ChatCompletionToolParam] = [
         },
     }
 ]
+model = "gpt-4o"
 
 app = FastAPI(
     docs_url="/docs",
@@ -78,9 +82,45 @@ class _ChatCompletionPayload(BaseModel):
     messages: list[Message]
 
 
-async def _chat_completion_stream(
-    payload: _ChatCompletionPayload,
-) -> AsyncGenerator[str, None]:
+def _function_call_message(
+    response: ChatCompletion,
+    messages: list[ChatCompletionMessageParam],
+    tool_id: str,
+    info_from_tool: str,
+) -> ChatCompletion:
+    _assistant_message = response.choices[0].message
+    assistant_message = ChatCompletionAssistantMessageParam(
+        role="assistant",
+        content=_assistant_message.content,
+        tool_calls=[
+            ChatCompletionMessageToolCallParam(
+                id=tool_call.id,
+                function=cast(Function, tool_call.function),
+                type="function",
+            )
+            for tool_call in (_assistant_message.tool_calls or [])
+        ],
+    )
+    messages.append(assistant_message)  # **
+    messages.append(
+        ChatCompletionToolMessageParam(
+            role="tool",
+            content=info_from_tool,
+            tool_call_id=tool_id,
+        )
+    )
+
+    final_response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        tools=tools,
+    )
+
+    return final_response
+
+
+@app.post("/chat_completion")
+async def _chat_completion(payload: _ChatCompletionPayload) -> JSONResponse:
     messages: list[ChatCompletionMessageParam] = []
     for message in payload.messages:
         if message.role == "assistant":
@@ -98,78 +138,53 @@ async def _chat_completion_stream(
                 )
             )
 
+    # Stream=trueだとfunction callがうまく動かない
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model=model,
         messages=messages,
         tools=tools,
-        stream=True,
     )
 
-    for chunk in response:
-        if chunk.choices and chunk.choices[0].delta.tool_calls:
-            for tool_call in chunk.choices[0].delta.tool_calls:
-                if tool_call.function is None or tool_call.id is None:
-                    continue
+    if response.choices and response.choices[0].message.tool_calls:
+        tool_call = response.choices[0].message.tool_calls[0]
+        if tool_call.function is None or tool_call.id is None:
+            return JSONResponse({"error": "Function call error"}, status_code=400)
 
-                print(tool_call.function.name)
-                print(tool_call.function.arguments)
+        print(f"Function: {tool_call.function.name}")
+        print(f"Arguments: {tool_call.function.arguments}")
 
-                if (
-                    tool_call.function.name == "get_weather"
-                    and tool_call.function.arguments
-                ):
-                    args = json.loads(tool_call.function.arguments)
-                    location = args.get("location")
-                    if not location:
-                        yield "エラー: location が指定されていません。"
-                        return
+        if tool_call.function.name == "get_weather":
+            args = json.loads(tool_call.function.arguments)
+            location = args.get("location")
+            if not location:
+                return JSONResponse(
+                    {"error": "location が指定されていません。"}, status_code=400
+                )
+            print(f"Location: {location}")
 
-                    geocoded = await geocode_location(location)
-                    if geocoded is None:
-                        yield f"エラー: '{location}' の緯度経度が取得できませんでした。"
-                        return
-                    latitude, longitude = geocoded
+            geocoded = await geocode_location(location)
+            if geocoded is None:
+                return JSONResponse(
+                    {"error": f"'{location}' の緯度経度が取得できませんでした。"},
+                    status_code=400,
+                )
+            latitude, longitude = geocoded
+            print(f"Latitude: {latitude}, Longitude: {longitude}")
 
-                    weather_result = await fetch_weather(latitude, longitude)
-                    if not weather_result.feature:
-                        yield "エラー: 天気情報が取得できませんでした。"
-                        return
+            weather_result = await fetch_weather(latitude, longitude)
+            rainfall = (
+                weather_result.feature[0].property_.weather_list.weather[0].rainfall
+            )
+            weather_info = f"{location} の降水量: {rainfall} mm"
+            print(f"Weather: {weather_info}")
 
-                    rainfall = (
-                        weather_result.feature[0]
-                        .property_.weather_list.weather[0]
-                        .rainfall
-                    )
-                    weather_info = f"{location} の降水量: {rainfall} mm"
+            final_response = _function_call_message(
+                response, messages, tool_call.id, weather_info
+            )
 
-                    messages.append(
-                        ChatCompletionToolMessageParam(
-                            role="tool",
-                            tool_call_id=tool_call.id,
-                            content=weather_info,
-                        )
-                    )
+            return JSONResponse({"response": final_response.choices[0].message.content})
 
-                    final_response = client.chat.completions.create(
-                        model="gpt-4o",
-                        messages=messages,
-                        tools=tools,
-                        stream=True,
-                    )
-
-                    for final_chunk in final_response:
-                        if final_chunk.choices and final_chunk.choices[0].delta.content:
-                            yield final_chunk.choices[0].delta.content
-
-        elif chunk.choices and chunk.choices[0].delta.content:
-            yield chunk.choices[0].delta.content
-
-
-@app.post("/chat_completion")
-async def _chat_completion(
-    payload: _ChatCompletionPayload,
-) -> StreamingResponse:
-    return StreamingResponse(_chat_completion_stream(payload), media_type="text/plain")
+    return JSONResponse({"response": response.choices[0].message.content})
 
 
 if __name__ == "__main__":

@@ -8,38 +8,25 @@ export const chatCompletionsAPI = async (
     received: (text: string) => void,
     finish: () => void
 ) => {
-    const response = await fetch(
-        "http://localhost:8080/chat_completion",
-        {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-                messages
-            }),
-        }
-    );
+    const response = await fetch("http://localhost:8080/chat_completion", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify({messages}),
+    });
 
-    if (!response.body) {
-        throw new Error("ReadableStream not yet supported in this browser.");
+    if (!response.ok) {
+        throw new Error(`Error: ${response.status} ${response.statusText}`);
     }
 
-    const reader = response.body.getReader();
+    const data = await response.json();
 
-    const processChunk = async ({
-                                    done, value
-                                }: ReadableStreamReadResult<Uint8Array>): Promise<void> => {
-        if (done) {
-            finish();
-            return;
-        }
+    if (data.response) {
+        received(data.response);
+    } else {
+        received("エラー: レスポンスが不正です");
+    }
 
-        const text = new TextDecoder().decode(value);
-        received(text);
-
-        reader.read().then(processChunk);
-    };
-
-    reader.read().then(processChunk);
+    finish();
 };
