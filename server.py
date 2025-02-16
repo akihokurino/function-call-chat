@@ -185,7 +185,6 @@ async def _chat_completion(payload: _ChatCompletionPayload) -> JSONResponse:
 
     print(f"Messages: {messages}")
 
-    # Stream=trueだとfunction callがうまく動かない
     response = client.chat.completions.create(
         model=model,
         messages=messages,
