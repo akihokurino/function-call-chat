@@ -160,7 +160,7 @@ async def _chat_completion(payload: _ChatCompletionPayload) -> JSONResponse:
             )
         )
     if len(payload.messages) > 1:
-        # 「最後のメッセージ以外」をすべてまとめて system ロールにする。
+        # 「最後のメッセージ以外」をすべてまとめてsystemロールにする。
         # assistantだとその内容からfunction callを実行されてしまう。
         # なので、systemで1つにまとめて、過去の内容からfunction callが実行されないようにする。
         context_lines = []
