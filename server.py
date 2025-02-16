@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Literal, final, cast
+from typing import Literal, final, cast, Optional
 
 import uvicorn
 from dotenv import load_dotenv
@@ -112,6 +112,44 @@ class _ChatCompletionPayload(BaseModel):
     messages: list[Message]
 
 
+# 「最後のメッセージ以外」をすべてまとめてsystemロールにする。
+# assistantだとその内容からfunction callを実行されてしまう。
+# なので、systemで1つにまとめて、過去の内容からfunction callが実行されないようにする。
+def _create_context_message(
+    messages: list[Message],
+) -> list[ChatCompletionMessageParam]:
+    context_messages: list[ChatCompletionMessageParam] = []
+    if len(messages) == 1:
+        context_messages.append(
+            ChatCompletionUserMessageParam(
+                role="user",
+                content=messages[0].content,
+            )
+        )
+    if len(messages) > 1:
+        context_lines = []
+        for msg in messages[:-1]:
+            if msg.role == "user":
+                context_lines.append(f"ユーザー: {msg.content}")
+            elif msg.role == "assistant":
+                context_lines.append(f"アシスタント: {msg.content}")
+        system_text = (
+            "以下は以前のやり取りです。"
+            "function callのトリガーには利用しないでください。\n\n"
+            + "\n".join(context_lines)
+        )
+        context_messages.append(
+            ChatCompletionSystemMessageParam(role="system", content=system_text)
+        )
+
+        last_msg = messages[-1]
+        context_messages.append(
+            ChatCompletionUserMessageParam(role="user", content=last_msg.content)
+        )
+    print(f"Messages: {context_messages}")
+    return context_messages
+
+
 def _answer_after_function_call(
     response: ChatCompletion,
     messages: list[ChatCompletionMessageParam],
@@ -149,42 +187,49 @@ def _answer_after_function_call(
     return final_response
 
 
-@app.post("/chat_completion")
-async def _chat_completion(payload: _ChatCompletionPayload) -> JSONResponse:
-    messages: list[ChatCompletionMessageParam] = []
-    if len(payload.messages) == 1:
-        messages.append(
-            ChatCompletionUserMessageParam(
-                role="user",
-                content=payload.messages[0].content,
-            )
-        )
-    if len(payload.messages) > 1:
-        # 「最後のメッセージ以外」をすべてまとめてsystemロールにする。
-        # assistantだとその内容からfunction callを実行されてしまう。
-        # なので、systemで1つにまとめて、過去の内容からfunction callが実行されないようにする。
-        context_lines = []
-        for msg in payload.messages[:-1]:
-            if msg.role == "user":
-                context_lines.append(f"ユーザー: {msg.content}")
-            elif msg.role == "assistant":
-                context_lines.append(f"アシスタント: {msg.content}")
-        system_text = (
-            "以下は以前のやり取りです。"
-            "function callのトリガーには利用しないでください。\n\n"
-            + "\n".join(context_lines)
-        )
-        messages.append(
-            ChatCompletionSystemMessageParam(role="system", content=system_text)
-        )
+async def _call_functon(function_name: str, arguments: str) -> str:
+    print(f"Function: {function_name}")
+    print(f"Arguments: {arguments}")
 
-        last_msg = payload.messages[-1]
-        messages.append(
-            ChatCompletionUserMessageParam(role="user", content=last_msg.content)
-        )
+    if function_name == "get_weather":
+        args = json.loads(arguments)
+        location = args.get("location")
+        if not location:
+            raise ValueError("location が指定されていません。")
+        print(f"Location: {location}")
 
-    print(f"Messages: {messages}")
+        geocoded = await geocode_location(location)
+        if geocoded is None:
+            raise ValueError(f"'{location}' の緯度経度が取得できませんでした。")
+        latitude, longitude = geocoded
+        print(f"Latitude: {latitude}, Longitude: {longitude}")
 
+        weather_result = await fetch_weather(latitude, longitude)
+        rainfall = weather_result.feature[0].property_.weather_list.weather[0].rainfall
+        weather_info = f"{location} の降水量: {rainfall} mmです。降水量を元に、天気を予測してください。"
+        return weather_info
+
+    if function_name == "send_email":
+        args = json.loads(arguments)
+        to = args.get("to")
+        subject = args.get("subject")
+        body = args.get("body")
+        if not to or not subject or not body:
+            raise ValueError("メール送信に必要な情報が不足しています。")
+
+        print(f"Send email to: {to}, Subject: {subject}, Body: {body}")
+        await send_email(to, subject, body)
+
+        email_response = f"メールを {to} に送信しました。件名: {subject}。この結果を質問者に伝えてください。"
+        return email_response
+
+    raise ValueError(f"Function '{function_name}' は存在しません。")
+
+
+async def _chat_completion_not_stream(
+    payload: _ChatCompletionPayload,
+) -> Optional[str]:
+    messages = _create_context_message(payload.messages)
     response = client.chat.completions.create(
         model=model,
         messages=messages,
@@ -193,64 +238,27 @@ async def _chat_completion(payload: _ChatCompletionPayload) -> JSONResponse:
 
     if response.choices and response.choices[0].message.tool_calls:
         tool_call = response.choices[0].message.tool_calls[0]
-        if tool_call.function is None or tool_call.id is None:
-            return JSONResponse({"error": "Function call error"}, status_code=400)
+        tool_result = await _call_functon(
+            tool_call.function.name, tool_call.function.arguments
+        )
+        final_response = _answer_after_function_call(
+            response, messages, tool_call.id, tool_result
+        )
+        return final_response.choices[0].message.content
+    else:
+        return response.choices[0].message.content
 
-        print(f"Function: {tool_call.function.name}")
-        print(f"Arguments: {tool_call.function.arguments}")
 
-        if tool_call.function.name == "get_weather":
-            args = json.loads(tool_call.function.arguments)
-            location = args.get("location")
-            if not location:
-                return JSONResponse(
-                    {"error": "location が指定されていません。"}, status_code=400
-                )
-            print(f"Location: {location}")
-
-            geocoded = await geocode_location(location)
-            if geocoded is None:
-                return JSONResponse(
-                    {"error": f"'{location}' の緯度経度が取得できませんでした。"},
-                    status_code=400,
-                )
-            latitude, longitude = geocoded
-            print(f"Latitude: {latitude}, Longitude: {longitude}")
-
-            weather_result = await fetch_weather(latitude, longitude)
-            rainfall = (
-                weather_result.feature[0].property_.weather_list.weather[0].rainfall
-            )
-            weather_info = f"{location} の降水量: {rainfall} mmです。降水量を元に、天気を予測してください。"
-            print(f"Weather: {weather_info}")
-
-            final_response = _answer_after_function_call(
-                response, messages, tool_call.id, weather_info
-            )
-            return JSONResponse({"response": final_response.choices[0].message.content})
-
-        if tool_call.function.name == "send_email":
-            args = json.loads(tool_call.function.arguments)
-            to = args.get("to")
-            subject = args.get("subject")
-            body = args.get("body")
-
-            if not to or not subject or not body:
-                return JSONResponse(
-                    {"error": "メール送信に必要な情報が不足しています。"},
-                    status_code=400,
-                )
-
-            print(f"Send email to: {to}, Subject: {subject}, Body: {body}")
-            await send_email(to, subject, body)
-
-            email_response = f"メールを {to} に送信しました。件名: {subject}。この結果を質問者に伝えてください。"
-            final_response = _answer_after_function_call(
-                response, messages, tool_call.id, email_response
-            )
-            return JSONResponse({"response": final_response.choices[0].message.content})
-
-    return JSONResponse({"response": response.choices[0].message.content})
+@app.post("/chat_completion")
+async def _chat_completion(payload: _ChatCompletionPayload) -> JSONResponse:
+    try:
+        response = await _chat_completion_not_stream(payload)
+        return JSONResponse(content={"response": response})
+    except Exception as e:
+        return JSONResponse(
+            content={"error": str(e)},
+            status_code=400,
+        )
 
 
 if __name__ == "__main__":
